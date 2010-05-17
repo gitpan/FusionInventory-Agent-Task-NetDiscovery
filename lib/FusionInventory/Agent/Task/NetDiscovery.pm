@@ -1,6 +1,7 @@
 package FusionInventory::Agent::Task::NetDiscovery;
+our $VERSION = '1.1';
 
-our $VERSION = '1.0';
+$ENV{XML_SIMPLE_PREFERRED_PARSER} = 'XML::SAX::PurePerl';
 
 use strict;
 #no strict 'refs';
@@ -15,7 +16,6 @@ if ($threads::VERSION > 1.32){
 use Data::Dumper;
 
 use XML::Simple;
-use File::stat;
 
 use FusionInventory::Agent::Config;
 use FusionInventory::Logger;
@@ -85,6 +85,8 @@ sub main {
 
         });
 
+   $self->{countxml} = 0;
+
    $self->StartThreads();
 
    exit(0);
@@ -93,7 +95,7 @@ sub main {
 
 sub StartThreads {
    my ($self, $params) = @_;
-
+   
 	my $nb_threads_discovery = $self->{NETDISCOVERY}->{PARAM}->[0]->{THREADS_DISCOVERY};
 	my $nb_core_discovery    = $self->{NETDISCOVERY}->{PARAM}->[0]->{CORE_DISCOVERY};
 
@@ -116,6 +118,7 @@ sub StartThreads {
    my %ArgumentsThread;
    my $maxIdx : shared = 0;
    my $storage = $self->{storage};
+   my $sendstart = 0;
 
    if ( eval { require Nmap::Parser; 1 } ) {
       $ModuleNmapParser = 1;
@@ -219,6 +222,7 @@ sub StartThreads {
                   $nbip++;
                   if ($nbip eq $limitip) {
                      if ($ip->ip() ne $self->{NETDISCOVERY}->{RANGEIP}->{IPEND}) {
+                        ++$ip;
                         $self->{NETDISCOVERY}->{RANGEIP}->{IPSTART} = $ip->ip();
                         $loop_action = 1;
                         goto CONTINUE;
@@ -252,6 +256,7 @@ sub StartThreads {
                         $nbip++;
                         if ($nbip eq $limitip) {
                            if ($ip->ip() ne $num->{IPEND}) {
+                              ++$ip;
                               $num->{IPSTART} = $ip->ip();
                               $loop_action = 1;
                               goto CONTINUE;
@@ -364,6 +369,7 @@ sub StartThreads {
 
                               if (keys %{$datadevice}) {
                                  $xml_threadt->{DEVICE}->[$count] = $datadevice;
+                                 $xml_threadt->{MODULEVERSION} = $VERSION;
                                  $xml_threadt->{PROCESSNUMBER} = $self->{NETDISCOVERY}->{PARAM}->[0]->{PID};
                                  $count++;
                               }
@@ -490,14 +496,18 @@ sub StartThreads {
               });
 
          # Send infos to server :
-         my $xml_thread = {};
-         $xml_thread->{AGENT}->{START} = '1';
-         $xml_thread->{AGENT}->{AGENTVERSION} = $self->{config}->{VERSION};
-         $xml_thread->{PROCESSNUMBER} = $self->{NETDISCOVERY}->{PARAM}->[0]->{PID};
-         $self->SendInformations({
-            data => $xml_thread
-            });
-         undef($xml_thread);
+         if ($sendstart eq "0") {
+            my $xml_thread = {};
+            $xml_thread->{AGENT}->{START} = '1';
+            $xml_thread->{AGENT}->{AGENTVERSION} = $self->{config}->{VERSION};
+            $xml_thread->{MODULEVERSION} = $VERSION;
+            $xml_thread->{PROCESSNUMBER} = $self->{NETDISCOVERY}->{PARAM}->[0]->{PID};
+            $self->SendInformations({
+               data => $xml_thread
+               });
+            undef($xml_thread);
+            $sendstart = 1;
+         }
 
          # Send NB ips to server :
          $xml_thread = {};
@@ -527,6 +537,7 @@ sub StartThreads {
                    $storage->remove({
                         idx => $idx
                      });
+                   sleep 1;
                 }
             }
         }
@@ -541,6 +552,7 @@ sub StartThreads {
                      data => $data
                  });
              $sentxml->{$idx} = 1;
+             sleep 1;
          }
 
       }
@@ -557,6 +569,7 @@ sub StartThreads {
    # Send infos to server :
    undef($xml_thread);
    $xml_thread->{AGENT}->{END} = '1';
+   $xml_thread->{MODULEVERSION} = $VERSION;
    $xml_thread->{PROCESSNUMBER} = $self->{NETDISCOVERY}->{PARAM}->[0]->{PID};
    sleep 1; # Wait for threads be terminated
    $self->SendInformations({
@@ -574,9 +587,9 @@ sub SendInformations{
    my $config = $self->{config};
 
    if ($config->{stdout}) {
-      $self->{inventory}->printXML();
+      $self->printXML();
    } elsif ($config->{local}) {
-      $self->{inventory}->writeXML();
+      $self->writeXML($message);
    } elsif ($config->{server}) {
 
       my $xmlMsg = FusionInventory::Agent::XML::Query::SimpleMessage->new(
@@ -707,6 +720,15 @@ sub discovery_ip_threaded {
                  $type = 1;
              }
          }
+         if (not exists($datadevice->{MAC})) {
+            my $NetbiosMac = $ns->mac_address;
+            $NetbiosMac =~ tr/-/:/;
+            $datadevice->{MAC} = $NetbiosMac;
+         } elsif ($datadevice->{MAC} !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+            my $NetbiosMac = $ns->mac_address;
+            $NetbiosMac =~ tr/-/:/;
+            $datadevice->{MAC} = $NetbiosMac;
+         }
       }
    }
 
@@ -761,7 +783,6 @@ sub discovery_ip_threaded {
 
                      # If Wyse thin clients
                      $description = wyse_discovery($description, $session);
-                     #$description = cisco_discovery($description);
 
                      # If Samsung printer detected, get best sysDescr
                      $description = samsung_discovery($description, $session);
@@ -780,6 +801,9 @@ sub discovery_ip_threaded {
 
                      # If AXIS printserver
                      $description = axis_discovery($description, $session);
+
+                     # If dd_wrt router
+                     $description = ddwrt_discovery($description, $session);
 
                      $datadevice->{DESCRIPTION} = $description;
 
@@ -804,13 +828,21 @@ sub discovery_ip_threaded {
                      if ($serial eq "No response from remote host") {
                         $serial = q{}; # Empty string
                      }
+                     $serial =~ s/^\s+//;
+                     $serial =~ s/\s+$//;
                      $datadevice->{SERIAL} = $serial;
                      $datadevice->{MODELSNMP} = $model;
                      $datadevice->{AUTHSNMP} = $key;
                      $datadevice->{TYPE} = $type;
                      $datadevice->{SNMPHOSTNAME} = $name;
                      $datadevice->{IP} = $params->{ip};
-                     $datadevice->{MAC} = $mac;
+                     if (exists($datadevice->{MAC})) {
+                        if ($datadevice->{MAC} !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+                           $datadevice->{MAC} = $mac;
+                        }
+                     } else {
+                        $datadevice->{MAC} = $mac;
+                     }
                      $datadevice->{ENTITY} = $params->{entity};
                      $self->{logger}->debug("[$params->{ip}] ".Dumper($datadevice));
                      #$session->close;
@@ -825,13 +857,15 @@ sub discovery_ip_threaded {
       }
    }
 
+   if (exists($datadevice->{MAC})) {
+      $datadevice->{MAC} =~ tr/A-F/a-f/;
+   }
    if ((exists($datadevice->{MAC})) || (exists($datadevice->{DNSHOSTNAME})) || (exists($datadevice->{NETBIOSNAME}))) {
       $datadevice->{IP} = $params->{ip};
       $datadevice->{ENTITY} = $params->{entity};
       $self->{logger}->debug("[$params->{ip}] ".Dumper($datadevice));
-   }
-   if (exists($datadevice->{MAC})) {
-      $datadevice->{MAC} =~ tr/A-F/a-f/;
+   } else {
+      $self->{logger}->debug("[$params->{ip}] Not found !");
    }
    return $datadevice;
 }
@@ -889,22 +923,70 @@ sub verifySerial {
                      });
 
          }
-         if (defined($num->{MACDYN})) {
-            $oid = $num->{MACDYN};
+        
+         $oid = $num->{MACDYN};
+         my $Arraymacreturn = {};
+         $Arraymacreturn  = $session->snmpWalk({
+                     oid_start => $oid
+                  });
+         while ( (undef,my $macadress) = each (%{$Arraymacreturn}) ) {
+            if (($macadress ne '') && ($macadress ne '0:0:0:0:0:0') && ($macadress ne '00:00:00:00:00:00')) {
+               if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+                  $macreturn = $macadress;
+               }
+            }
+         }
+
+         # Mac of switchs
+         if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+            $oid = ".1.3.6.1.2.1.17.1.1.0";
+            $macreturn  = $session->snmpGet({
+                        oid => $oid,
+                        up  => 0,
+                     });
+         }
+         if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+            $oid = ".1.3.6.1.2.1.2.2.1.6";
             my $Arraymacreturn = {};
             $Arraymacreturn  = $session->snmpWalk({
                         oid_start => $oid
                      });
             while ( (undef,my $macadress) = each (%{$Arraymacreturn}) ) {
-               if ($macadress ne '') {
-                  $macreturn = $macadress;
+               if (($macadress ne '') && ($macadress ne '0:0:0:0:0:0') && ($macadress ne '00:00:00:00:00:00')) {
+                  if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+                     $macreturn = $macadress;
+                  }
                }
             }
-
          }
+
          return ($serialreturn, $typereturn, $modelreturn, $macreturn);
       }
    }
+
+   # Mac of switchs
+   if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+      $oid = ".1.3.6.1.2.1.17.1.1.0";
+      $macreturn  = $session->snmpGet({
+                  oid => $oid,
+                  up  => 0,
+               });
+   }
+   if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+      $oid = ".1.3.6.1.2.1.2.2.1.6";
+      my $Arraymacreturn = {};
+      $Arraymacreturn  = $session->snmpWalk({
+                  oid_start => $oid
+               });
+      while ( (undef,my $macadress) = each (%{$Arraymacreturn}) ) {
+         if (($macadress ne '') && ($macadress ne '0:0:0:0:0:0') && ($macadress ne '00:00:00:00:00:00')) {
+            if ($macreturn !~ /^([0-9a-f]{2}([:]|$)){6}$/i) {
+               $macreturn = $macadress;
+            }
+         }
+      }
+   }
+
 	return ("", 0, "", "");
 }
 
@@ -1039,16 +1121,43 @@ sub kyocera_discovery {
       if (($description_new ne "null") && ($description_new ne "No response from remote host")) {
          $description = $description_new;
       }
-   } elsif ($description eq "KYOCERA MITA Printing System") {
+   } elsif (($description eq "KYOCERA MITA Printing System") || ($description eq "KYOCERA Printer I/F")) {
       my $description_new = $session->snmpGet({
                         oid => '.1.3.6.1.4.1.1347.42.5.1.1.2.1',
                         up  => 1,
                      });
       if (($description_new ne "null") && ($description_new ne "No response from remote host")) {
          $description = $description_new;
+      } elsif ($description_new eq "No response from remote host") {
+         my $description_new = $session->snmpGet({
+                        oid => '.1.3.6.1.4.1.1347.43.5.1.1.1.1',
+                        up  => 1,
+                     });
+         if (($description_new ne "null") && ($description_new ne "No response from remote host")) {
+            $description = $description_new;
+         } elsif ($description_new eq "No response from remote host") {
+            my $description_new = $session->snmpGet({
+                           oid => '.1.3.6.1.4.1.11.2.3.9.1.1.7.0',
+                           up  => 1,
+                        });
+            if (($description_new ne "null") && ($description_new ne "No response from remote host")) {
+               my @infos = split(/;/,$description_new);
+               foreach (@infos) {
+                  if ($_ =~ /^MDL:/) {
+                     $_ =~ s/MDL://;
+                     $description = $_;
+                     last;
+                  } elsif ($_ =~ /^MODEL:/) {
+                     $_ =~ s/MODEL://;
+                     $description = $_;
+                     last;
+                  }
+               }
+            }
+         }
       }
 
-   }
+}
    return $description;
 }
 
@@ -1108,4 +1217,167 @@ sub axis_discovery {
 }
 
 
+sub ddwrt_discovery {
+   my $description = shift;
+   my $session     = shift;
+
+   if ($description =~ m/Linux/) {
+      my $description_new = $session->snmpGet({
+                        oid => '.1.3.6.1.2.1.1.5.0',
+                        up  => 1,
+                     });
+      if ($description_new eq "dd-wrt") {
+         $description = "dd-wrt";
+      }
+   }
+   return $description;
+}
+
+
+
+
+
+
+sub printXML {
+  my ($self, $args) = @_;
+
+  print $self->getContent();
+}
+
+
+sub writeXML {
+  my ($self, $message) = @_;
+
+  my $logger = $self->{logger};
+  my $config = $self->{config};
+  my $target = $self->{target};
+
+  if ($target->{path} =~ /^$/) {
+    $logger->fault ('local path unititalised!');
+  }
+
+   my $dir = $self->{NETDISCOVERY}->{PARAM}->[0]->{PID};
+  $dir =~ s/\//-/;
+
+  my $localfile = $config->{local}."/".$target->{deviceid}.'.'.$dir.'-'.$self->{countxml}.'.xml';
+  $localfile =~ s!(//){1,}!/!;
+
+  $self->{countxml} = $self->{countxml} + 1;
+
+  # Convert perl data structure into xml strings
+
+   my $xmlMsg = FusionInventory::Agent::XML::Query::SimpleMessage->new(
+        {
+            config => $self->{config},
+            logger => $self->{logger},
+            target => $self->{target},
+            msg    => {
+                QUERY => 'NETDISCOVERY',
+                CONTENT   => $message->{data},
+            },
+        });
+
+  if (open OUT, ">$localfile") {
+    print OUT $xmlMsg;
+
+    close OUT or warn;
+    $logger->info("Inventory saved in $localfile");
+  } else {
+    warn "Can't open `$localfile': $!"
+  }
+}
+
+
 1;
+
+__END__
+
+=head1 NAME
+
+FusionInventory::Agent::Task::NetDiscovery - SNMP support for FusionInventory Agent
+
+=head1 DESCRIPTION
+
+This module scans your networks to get informations from devices with SNMP protocol
+
+=over 4
+
+=item *
+networking devices discovery within an IP range
+
+=item *
+network switche, printer and router analyse
+
+=item *
+relation between computer / printer / switch port
+
+=item *
+identify unknown MAC addresses
+
+=item *
+report printer cartridge and ounter status
+
+=item *
+support management of SNMP versions v1, v2, v3
+
+=back
+
+The plugin depends on FusionInventory for GLPI.
+
+=head1 AUTHORS
+
+The maintainer is David DURIEUX <d.durieux@siprossii.com>
+
+Please read the AUTHORS, Changes and THANKS files to see who is behind
+FusionInventory.
+
+=head1 SEE ALSO
+
+=over 4
+
+=item *
+FusionInventory website: L<http://www.FusionInventory.org/>
+
+=item *
+LaunchPad project page: L<http://launchpad.net/fusioninventory-agent-task-netdiscovery>
+
+=item *
+the Mailing lists and IRC
+
+=back
+
+=head1 BUGS
+
+Please, use the mailing lists as much as possible. You can open your own bug
+tickets. Patches are welcome. You can also use LaunchPad bugtracker or
+push your Bazaar branch on LaunchPad and do a merge request.
+
+=head1 COPYRIGHT
+
+=over 4
+
+=item *
+
+Copyright (C) 2009 David Durieux
+
+=item *
+
+=back
+
+Copyright (C) 2010 FusionInventory Team
+
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program; if not, write to the Free Software
+ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+=cut
