@@ -1,5 +1,5 @@
 package FusionInventory::Agent::Task::NetDiscovery;
-our $VERSION = '1.2';
+our $VERSION = '1.3';
 
 $ENV{XML_SIMPLE_PREFERRED_PARSER} = 'XML::SAX::PurePerl';
 
@@ -18,6 +18,9 @@ use Data::Dumper;
 use XML::Simple;
 use Digest::MD5 qw(md5_hex);
 
+use XML::TreePP;
+use English qw(-no_match_vars);
+
 use FusionInventory::Agent::Config;
 use FusionInventory::Logger;
 use FusionInventory::Agent::Storage;
@@ -30,6 +33,48 @@ use FusionInventory::Agent::Task::NetDiscovery::Dico;
 use FusionInventory::Agent::Task::NetDiscovery::Manufacturer::HewlettPackard;
 
 use FusionInventory::Agent::AccountInfo;
+
+sub parseNmapVersion {
+    my $s;
+
+    $s .= $_ foreach @_;
+
+    return unless $s =~ /Nmap version (\S+) /;
+
+    return $1;
+}
+
+sub compareNmapVersion {
+    my ($v1, $v2) = @_;
+
+    return $v1 >= $v2;
+}
+
+sub parseNmap {
+    my ($xml) = @_;
+
+    my $tpp = XML::TreePP->new(force_array => '*');
+    my $h = $tpp->parse($xml);
+    return unless $h;
+
+    my $ret = {};
+    foreach my $host (@{$h->{nmaprun}[0]{host}}) {
+        foreach (@{$host->{address}}) {
+            if ($_->{'-addrtype'} eq 'mac') {
+                $ret->{MAC} = $_->{'-addr'} unless $ret->{MAC};
+                $ret->{NETPORTVENDOR} = $_->{'-vendor'} unless $ret->{NETPORTVENDOR};
+            }
+        }
+        foreach (@{$host->{hostnames}}) {
+            my $name = eval {$_->{hostname}[0]{'-name'}};
+            next unless $name;
+            $ret->{DNSHOSTNAME} = $name;
+        }
+    }
+
+    return $ret;
+}
+
 
 sub main {
     my ( undef ) = @_;
@@ -44,7 +89,7 @@ sub main {
 
     my $data = $storage->restore({ module => "FusionInventory::Agent" });
     $self->{data} = $data;
-    my $myData = $self->{myData} = $storage->restore();
+   my $myData = $self->{myData} = $storage->restore();
 
     my $config = $self->{config} = $data->{config};
     my $target = $self->{'target'} = $data->{'target'};
@@ -55,7 +100,7 @@ sub main {
     $self->{logger}->debug("FusionInventory NetDiscovery module ".$VERSION);
 
     if ($target->{type} ne 'server') {
-        $logger->debug("No server. Exiting...");
+        $logger->debug("No server to get order from. Exiting...");
         exit(0);
     }
 
@@ -75,12 +120,12 @@ sub main {
       }
     }
     if ($continue eq "0") {
-        $logger->debug("No NETDISCOVERY. Exiting...");
+        $logger->debug("No NETDISCOVERY Asked by the server. Exiting...");
         exit(0);
     }
 
     if ($target->{'type'} ne 'server') {
-        $logger->debug("No server. Exiting...");
+        $logger->debug("No server to get order from. Exiting...");
         exit(0);
     }
 
@@ -119,6 +164,7 @@ sub StartThreads {
 
    my $ModuleNmapScanner = 0;
    my $ModuleNmapParser  = 0;
+   my $ModuleNmapParserParameter;
    my $ModuleNetNBName   = 0;
    my $ModuleNetSNMP     = 0;
    my $iplist = {};
@@ -131,13 +177,20 @@ sub StartThreads {
    my $dico;
    my $dicohash;
 
+   my $nmap_version = parseNmapVersion(`nmap -V`);
+   if (compareNmapVersion(5.29, $nmap_version)) {
+       $ModuleNmapParserParameter = "-sP --system-dns --max-retries 1 --max-rtt-timeout 1000 ";
+   } else {
+       $ModuleNmapParserParameter = "-sP -PP --system-dns --max-retries 1 --max-rtt-timeout 1000ms ";
+   }
+
    # Load storage with XML dico
    if (defined($self->{NETDISCOVERY}->{DICO})) {
       $storage->save({
             idx => 999998,
-            data => $self->{NETDISCOVERY}->{DICO}
+            data => XMLin($self->{NETDISCOVERY}->{DICO})
         });
-      $dicohash->{HASH} = md5_hex($self->{NETDISCOVERY}->{DICO});
+      $dicohash->{HASH} = $self->{NETDISCOVERY}->{DICOHASH};
       $storage->save({
             idx => 999999,
             data => $dicohash
@@ -151,7 +204,7 @@ sub StartThreads {
          idx => 999999
       });
 
-   if ( (!defined($dico)) || !(%$dico)) {
+   if ( (!defined($dico)) || (ref($dico) ne "HASH")) {
       $dico = FusionInventory::Agent::Task::NetDiscovery::Dico::loadDico();
       $storage->save({
             idx => 999998,
@@ -177,32 +230,31 @@ sub StartThreads {
             data => $xml_thread
             });
          undef($xml_thread);
-         $self->{logger}->debug("Dico is old. Exiting...");
+         $self->{logger}->debug("Dico is to old (".$dicohash->{HASH}." vs ".$self->{NETDISCOVERY}->{DICOHASH}."). Exiting...");
          exit(0);
       }
    }
    $self->{logger}->debug("Dico loaded.");
 
-   if ( eval { require Nmap::Parser; 1 } ) {
-      $ModuleNmapParser = 1;
-   } elsif ( eval { require Nmap::Scanner; 1 } ) {
-      if ($@) {
-         $self->{logger}->debug("Can't load Nmap::Parser && map::Scanner. Nmap can't be used!");
-      } else {
-         $ModuleNmapScanner = 1;
-      }
-   }
+#   if ( eval { require Nmap::Parser; 1 } ) {
+#      $ModuleNmapParser = 1;
+#      my $scan = new Nmap::Parser;
+#   } elsif ( eval { require Nmap::Scanner; 1 } ) {
+#       $ModuleNmapScanner = 1;
+#   } else {
+#       $self->{logger}->error("Can't load Nmap::Parser && map::Scanner. Nmap can't be used!");
+#   }
    
    if ( eval { require Net::NBName; 1 } ) {
       $ModuleNetNBName = 1;
    } else {
-      $self->{logger}->debug("Can't load Net::NBName. Netbios detection can't be used!");
+      $self->{logger}->error("Can't load Net::NBName. Netbios detection can't be used!");
    }
 
    if ( eval { require Net::SNMP; 1 } ) {
       $ModuleNetSNMP = 1;
    } else {
-      $self->{logger}->debug("Can't load Net::SNMP. SNMP detection can't be used!");
+      $self->{logger}->error("Can't load Net::SNMP. SNMP detection can't be used!");
    }
 
 
@@ -425,6 +477,7 @@ sub StartThreads {
                                     ModuleNmapScanner   => $ModuleNmapScanner,
                                     ModuleNetNBName     => $ModuleNetNBName,
                                     ModuleNmapParser    => $ModuleNmapParser,
+                                    ModuleNmapParserParameter => $ModuleNmapParserParameter,
                                     ModuleNetSNMP       => $ModuleNetSNMP,
                                     dico                => $dico
                                  });
@@ -481,17 +534,17 @@ sub StartThreads {
 
                      while (1) {
                         if (($loop_action eq "0") && ($exit eq "2")) {
-                           ## Kill threads who do nothing partiel ##
+                           ## Kill threads who do nothing partial ##
 #                              for($i = ($loop_nbthreads - 1) ; $i < $self->{NETDISCOVERY}->{PARAM}->[0]->{THREADS_DISCOVERY} ; $i++) {
 #                                 $ThreadAction{$i} = "3";
 #                              }
 
-                           ## Start + end working threads (faire fonction) ##
+                           ## Start + end working threads (do a function) ##
                               for($i = 0 ; $i < $loop_nbthreads ; $i++) {
                                  $ThreadAction{$i} = "2";
                                  #$ThreadState{$i} = "1";
                               }
-                           ## Fonction etat des working threads (s'ils sont arretes) ##
+                           ## Function state of working threads (if they are stopped) ##
                               $count = 0;
                               $loopthread = 0;
 
@@ -512,14 +565,14 @@ sub StartThreads {
                               return;
                               
                         } elsif (($loop_action eq "1") && ($exit eq "2")) {
-                           ## Start + pause working Threads (faire fonction) ##
+                           ## Start + pause working Threads (do a function) ##
                               for($i = 0 ; $i < $loop_nbthreads ; $i++) {
                                  $ThreadAction{$i} = "1";
                                  #$ThreadState{$i} = "1";
                               }
                            sleep 1;
 
-                           ## Fonction etat des working threads (s'il sont tous en pause) ##
+                           ## Function state of working threads (if they are paused) ##
                            $count = 0;
                            $loopthread = 0;
 
@@ -620,7 +673,7 @@ sub StartThreads {
          }
 
       }
-      $storage->removeSubDumps();
+#      $storage->removeSubDumps();
 
       } 
      if ($nb_core_discovery > 1) {
@@ -669,9 +722,12 @@ sub AuthParser {
    my ($self, $dataAuth) = @_;
 
    my $authlist = {};
+   my $authlistpublic = {};
+   my $counter = 0;
 
    if (ref($dataAuth->{AUTHENTICATION}) eq "HASH"){
-      $authlist->{$dataAuth->{AUTHENTICATION}->{ID}} = {
+      $authlist->{$counter} = {
+               ID             => $dataAuth->{AUTHENTICATION}->{ID},
                COMMUNITY      => $dataAuth->{AUTHENTICATION}->{COMMUNITY},
                VERSION        => $dataAuth->{AUTHENTICATION}->{VERSION},
                USERNAME       => $dataAuth->{AUTHENTICATION}->{USERNAME},
@@ -680,19 +736,50 @@ sub AuthParser {
                PRIVPASSWORD   => $dataAuth->{AUTHENTICATION}->{PRIVPASSPHRASE},
                PRIVPROTOCOL   => $dataAuth->{AUTHENTICATION}->{PRIVPROTOCOL}
             };
+
    } else {
       foreach my $num (@{$dataAuth->{AUTHENTICATION}}) {
-         $authlist->{ $num->{ID} } = {
-               COMMUNITY      => $num->{COMMUNITY},
-               VERSION        => $num->{VERSION},
-               USERNAME       => $num->{USERNAME},
-               AUTHPASSWORD   => $num->{AUTHPASSPHRASE},
-               AUTHPROTOCOL   => $num->{AUTHPROTOCOL},
-               PRIVPASSWORD   => $num->{PRIVPASSPHRASE},
-               PRIVPROTOCOL   => $num->{PRIVPROTOCOL}
-            };
+         if ($num->{COMMUNITY} eq "public") {
+            $authlistpublic->{$num->{ID}} = {
+                   ID             => $num->{ID},
+                   COMMUNITY      => $num->{COMMUNITY},
+                   VERSION        => $num->{VERSION},
+                   USERNAME       => $num->{USERNAME},
+                   AUTHPASSWORD   => $num->{AUTHPASSPHRASE},
+                   AUTHPROTOCOL   => $num->{AUTHPROTOCOL},
+                   PRIVPASSWORD   => $num->{PRIVPASSPHRASE},
+                   PRIVPROTOCOL   => $num->{PRIVPROTOCOL}
+                };
+          } else {
+             $authlist->{$counter} = {
+                   ID             => $num->{ID},
+                   COMMUNITY      => $num->{COMMUNITY},
+                   VERSION        => $num->{VERSION},
+                   USERNAME       => $num->{USERNAME},
+                   AUTHPASSWORD   => $num->{AUTHPASSPHRASE},
+                   AUTHPROTOCOL   => $num->{AUTHPROTOCOL},
+                   PRIVPASSWORD   => $num->{PRIVPASSPHRASE},
+                   PRIVPROTOCOL   => $num->{PRIVPROTOCOL}
+                };
+             $counter++;
+          }
       }
    }
+
+   for my $num ( keys %{$authlistpublic} ) {
+       $authlist->{$counter} = {
+                   ID             => $authlistpublic->{$num}->{ID},
+                   COMMUNITY      => $authlistpublic->{$num}->{COMMUNITY},
+                   VERSION        => $authlistpublic->{$num}->{VERSION},
+                   USERNAME       => $authlistpublic->{$num}->{USERNAME},
+                   AUTHPASSWORD   => $authlistpublic->{$num}->{AUTHPASSPHRASE},
+                   AUTHPROTOCOL   => $authlistpublic->{$num}->{AUTHPROTOCOL},
+                   PRIVPASSWORD   => $authlistpublic->{$num}->{PRIVPASSPHRASE},
+                   PRIVPROTOCOL   => $authlistpublic->{$num}->{PRIVPROTOCOL}
+                };
+        $counter++;
+    }
+
    return $authlist;
 }
 
@@ -713,48 +800,14 @@ sub discovery_ip_threaded {
    }
 
    #** Nmap discovery
-   if ($params->{ModuleNmapParser} eq "1") {
-      my $scan = new Nmap::Parser;
-      if (eval {$scan->parsescan('nmap','-sP --system-dns --max-retries 1 --max-rtt-timeout 1000 ', $params->{ip})}) {
-         if (exists($scan->{HOSTS}->{$params->{ip}}->{addrs}->{mac}->{addr})) {
-            $datadevice->{MAC} = special_char($scan->{HOSTS}->{$params->{ip}}->{addrs}->{mac}->{addr});
-         }
-         if (exists($scan->{HOSTS}->{$params->{ip}}->{addrs}->{mac}->{vendor})) {
-            $datadevice->{NETPORTVENDOR} = special_char($scan->{HOSTS}->{$params->{ip}}->{addrs}->{mac}->{vendor});
-         }
-
-         if (exists($scan->{HOSTS}->{$params->{ip}}->{hostnames}->[0])) {
-            $datadevice->{DNSHOSTNAME} = special_char($scan->{HOSTS}->{$params->{ip}}->{hostnames}->[0]);
-         }
-      }
-   } elsif ($params->{ModuleNmapScanner} eq "1") {
-      my $scan = new Nmap::Scanner;
-      my $results_nmap = $scan->scan('-sP --system-dns --max-retries 1 --max-rtt-timeout 1000 '.$params->{ip});
-
-      my $xml_nmap = new XML::Simple;
-      my $macaddress = q{}; # Empty string
-      my $hostname = q{}; # Empty string
-      my $netportvendor = q{}; # Empty string
-
-      foreach my $key (keys (%{$$results_nmap{'ALLHOSTS'}})) {
-         for (my $n=0; $n<@{$$results_nmap{'ALLHOSTS'}{$key}{'addresses'}}; $n++) {
-            if ($$results_nmap{'ALLHOSTS'}{$key}{'addresses'}[$n]{'addrtype'} eq "mac") {
-               $datadevice->{MAC} = special_char($$results_nmap{'ALLHOSTS'}{$key}{'addresses'}[$n]{'addr'});
-               if (defined($$results_nmap{'ALLHOSTS'}{$key}{'addresses'}[$n]{'vendor'})) {
-                  $datadevice->{NETPORTVENDOR} = special_char($$results_nmap{'ALLHOSTS'}{$key}{'addresses'}[$n]{'vendor'});
-               }
-            }
-         }
-         if (exists($$results_nmap{'ALLHOSTS'}{$key}{'hostnames'}[0])) {
-            for (my $n=0; $n<@{$$results_nmap{'ALLHOSTS'}{$key}{'hostnames'}}; $n++) {
-               $datadevice->{DNSHOSTNAME} = special_char($$results_nmap{'ALLHOSTS'}{$key}{'hostnames'}[$n]{'name'});
-            }
-         }
-      }
-   }
+   my $nmapCmd = "nmap $params->{ModuleNmapParserParameter} $params->{ip} -oX -";
+   my $xml = `$nmapCmd`;
+   $datadevice = parseNmap($xml);
 
    #** Netbios discovery
    if ($params->{ModuleNetNBName} eq "1") {
+      $self->{logger}->debug("[".$params->{ip}."] : Netbios discovery");
+
       my $nb = Net::NBName->new;
 
       my $domain = q{}; # Empty string
@@ -791,6 +844,7 @@ sub discovery_ip_threaded {
 
 
    if ($params->{ModuleNetSNMP} eq "1") {
+      $self->{logger}->debug("[".$params->{ip}."] : SNMP discovery");
       my $i = "4";
       my $snmpv;
       while ($i ne "1") {
@@ -799,7 +853,7 @@ sub discovery_ip_threaded {
          if ($i eq "2") {
             $snmpv = "2c";
          }
-         for my $key ( keys %{$params->{authlist}} ) {
+         for my $key ( sort(keys %{$params->{authlist}} )) {
             if ($params->{authlist}->{$key}->{VERSION} eq $snmpv) {
                my $session = new FusionInventory::Agent::SNMP ({
 
@@ -849,8 +903,8 @@ sub discovery_ip_threaded {
                         $name = q{}; # Empty string
                      }
                      # Serial Number
-                     my ($serial, $type, $model, $mac) = verifySerial($description, $session, $params->{dico});
-                     if ($serial eq "Received noSuchName(2) error-status at error-index 1") {
+                     my ($serial, $type, $model, $mac) = $self->verifySerial($description, $session, $params->{dico}, $params->{ip});
+                    if ($serial eq "Received noSuchName(2) error-status at error-index 1") {
                         $serial = q{}; # Empty string
                      }
                      if ($serial eq "noSuchInstance") {
@@ -867,7 +921,7 @@ sub discovery_ip_threaded {
                      $serial =~ s/(\.{2,})*//g;
                      $datadevice->{SERIAL} = $serial;
                      $datadevice->{MODELSNMP} = $model;
-                     $datadevice->{AUTHSNMP} = $key;
+                     $datadevice->{AUTHSNMP} = $params->{authlist}->{$key}->{ID};
                      $datadevice->{TYPE} = $type;
                      $datadevice->{SNMPHOSTNAME} = $name;
                      $datadevice->{IP} = $params->{ip};
@@ -900,7 +954,7 @@ sub discovery_ip_threaded {
       $datadevice->{ENTITY} = $params->{entity};
       $self->{logger}->debug("[$params->{ip}] ".Dumper($datadevice));
    } else {
-      $self->{logger}->debug("[$params->{ip}] Not found !");
+      $self->{logger}->debug("[$params->{ip}] Not found");
    }
    return $datadevice;
 }
@@ -923,10 +977,11 @@ sub special_char {
 
 
 sub verifySerial {
-   my $description = shift;
-   my $session     = shift;
-   my $dico    = shift;
-
+   my ($self, $description, $session, $dico, $ip) = @_;
+   
+   if ($description eq "noSuchObject") {
+      return ("", 0, "", "");
+   }
    my $oid;
    my $macreturn = q{}; # Empty string
    my $modelreturn = q{}; # Empty string
@@ -938,7 +993,7 @@ sub verifySerial {
 
    foreach my $num (@{$dico->{DEVICE}}) {
       if ($num->{SYSDESCR} eq $description) {
-         
+          
          if (defined($num->{SERIAL})) {
             $oid = $num->{SERIAL};
 				$serial = $session->snmpGet({
@@ -1026,60 +1081,14 @@ sub verifySerial {
             }
          }
       }
+
    }
-
-	return ("", 0, "", "");
+   if ($macreturn ne '') {
+      return ("", 0, "", $macreturn);
+   }
+   return ("", 0, "", "");
 }
 
-
-sub printXML {
-  my ($self, $args) = @_;
-
-  print $self->getContent();
-}
-
-
-sub writeXML {
-  my ($self, $message) = @_;
-
-  my $logger = $self->{logger};
-  my $config = $self->{config};
-  my $target = $self->{target};
-
-  if ($target->{path} =~ /^$/) {
-    $logger->fault ('local path unititalised!');
-  }
-
-   my $dir = $self->{NETDISCOVERY}->{PARAM}->[0]->{PID};
-  $dir =~ s/\//-/;
-
-  my $localfile = $config->{local}."/".$target->{deviceid}.'.'.$dir.'-'.$self->{countxml}.'.xml';
-  $localfile =~ s!(//){1,}!/!;
-
-  $self->{countxml} = $self->{countxml} + 1;
-
-  # Convert perl data structure into xml strings
-
-   my $xmlMsg = FusionInventory::Agent::XML::Query::SimpleMessage->new(
-        {
-            config => $self->{config},
-            logger => $self->{logger},
-            target => $self->{target},
-            msg    => {
-                QUERY => 'NETDISCOVERY',
-                CONTENT   => $message->{data},
-            },
-        });
-
-  if (open OUT, ">$localfile") {
-    print OUT $xmlMsg;
-
-    close OUT or warn;
-    $logger->info("Inventory saved in $localfile");
-  } else {
-    warn "Can't open `$localfile': $!"
-  }
-}
 
 sub initModList {
    my $self = shift;
@@ -1146,7 +1155,7 @@ FusionInventory::Agent::Task::NetDiscovery - SNMP support for FusionInventory Ag
 
 =head1 DESCRIPTION
 
-This module scans your networks to get informations from devices with SNMP protocol
+This module scans your networks to get informations from devices with the SNMP protocol
 
 =over 4
 
@@ -1154,23 +1163,23 @@ This module scans your networks to get informations from devices with SNMP proto
 networking devices discovery within an IP range
 
 =item *
-network switche, printer and router analyse
+network switches, printers and routers analysis
 
 =item *
-relation between computer / printer / switch port
+relation between computers / printers / switchs ports
 
 =item *
 identify unknown MAC addresses
 
 =item *
-report printer cartridge and ounter status
+report printer cartridge and counter status
 
 =item *
 support management of SNMP versions v1, v2, v3
 
 =back
 
-The plugin depends on FusionInventory for GLPI.
+This plugin depends on FusionInventory for GLPI.
 
 =head1 AUTHORS
 
@@ -1183,35 +1192,60 @@ FusionInventory.
 
 =over 4
 
-=item *
+=item
 FusionInventory website: L<http://www.FusionInventory.org/>
 
-=item *
-LaunchPad project page: L<http://launchpad.net/fusioninventory-agent-task-netdiscovery>
+=item
 
-=item *
-the Mailing lists and IRC
+project Forge: L<http://Forge.FusionInventory.org>
+
+=item
+
+The source code of the agent is available on:
+
+=over
+
+=item
+
+Gitorious: L<http://gitorious.org/fusioninventory>
+
+=item
+
+Github: L<http://github.com/fusinv/fusioninventory-agent>
+
+=back
+
+=item
+
+The mailing lists:
+
+=over
+
+=item
+
+L<http://lists.alioth.debian.org/mailman/listinfo/fusioninventory-devel>
+
+=item
+
+L<http://lists.alioth.debian.org/mailman/listinfo/fusioninventory-user>
+
+=back
+
+=item
+
+IRC: #FusionInventory on FreeNode IRC Network
 
 =back
 
 =head1 BUGS
 
 Please, use the mailing lists as much as possible. You can open your own bug
-tickets. Patches are welcome. You can also use LaunchPad bugtracker or
-push your Bazaar branch on LaunchPad and do a merge request.
+tickets. Patches are welcome. You can also use the bugtracker on
+http://forge.fusionInventory.org
 
 =head1 COPYRIGHT
 
-=over 4
-
-=item *
-
 Copyright (C) 2009 David Durieux
-
-=item *
-
-=back
-
 Copyright (C) 2010 FusionInventory Team
 
  This program is free software; you can redistribute it and/or modify

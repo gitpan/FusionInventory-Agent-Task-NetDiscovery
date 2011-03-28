@@ -20,11 +20,11 @@ requires:
   Net::IP: 0
   Net::NBName: 0
   Net::SNMP: 0
-  Nmap::Parser: 0
   Parallel::ForkManager: 0
   XML::Simple: 0
+  XML::TreePP: 0
   perl: 5.6.0
   threads: 0
 resources:
   license: http://opensource.org/licenses/gpl-license.php
-version: 1.2
+version: 1.3
