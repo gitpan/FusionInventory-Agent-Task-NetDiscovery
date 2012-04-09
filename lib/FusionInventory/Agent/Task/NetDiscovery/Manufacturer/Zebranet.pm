@@ -1,32 +1,28 @@
 package FusionInventory::Agent::Task::NetDiscovery::Manufacturer::Zebranet;
 
+use strict;
+use warnings;
 
-sub discovery {
-   my $empty       = shift;
-   my $description = shift;
-   my $session     = shift;
+sub getDescription {
+    my ($snmp) = @_;
 
-   if($description =~ m/ZebraNet PrintServer/) {
-      my $description_new = $session->snmpGet({
-                     oid => '.1.3.6.1.4.1.11.2.3.9.1.1.7.0',
-                     up  => 1,
-                  });
-      if ($description_new ne "null") {
-         my @infos = split(/;/,$description_new);
-         foreach (@infos) {
-            if ($_ =~ /^MDL:/) {
-               $_ =~ s/MDL://;
-               $description = $_;
-               last;
-            } elsif ($_ =~ /^MODEL:/) {
-               $_ =~ s/MODEL://;
-               $description = $_;
-               last;
-            }
-         }
-      }
-   }
-   return $description;
+    my $result = $snmp->get('.1.3.6.1.4.1.10642.1.1.0');
+    return $result if $result;
+
+    my $result = $snmp->get('.1.3.6.1.4.1.11.2.3.9.1.1.7.0');
+    return unless $result;
+
+    my @infos = split(/;/, $result);
+    foreach (@infos) {
+        if ($_ =~ /^MDL:/) {
+            $_ =~ s/MDL://;
+            return $_;
+        } elsif ($_ =~ /^MODEL:/) {
+            $_ =~ s/MODEL://;
+            return $_;
+        }
+    }
+
 }
 
 1;
