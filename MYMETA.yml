@@ -24,4 +24,4 @@ requires:
   XML::TreePP: 0.26
   perl: 5.008
   threads: 0
-version: 2.0
+version: 2.1
